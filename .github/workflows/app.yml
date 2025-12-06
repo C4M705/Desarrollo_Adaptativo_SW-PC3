@@ -1,0 +1,161 @@
+name: Deploy Application
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "supabase/**"
+      - "app-code/**"
+
+env:
+  AWS_REGION: "sa-east-1"
+  NODE_VERSION: "21"
+  JAVA_VERSION: "17"
+  WORKING_DIR_DB: "./app-code/database"
+  WORKING_DIR_BACKEND: "./app-code/backend"
+  WORKING_DIR_FRONTEND: "./app-code/frontend"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  download-infra-outputs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Infra Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: infra-outputs
+
+      - name: Load Infra Outputs
+        id: parse
+        run: |
+          echo "INFRA_OUTPUTS=$(cat infra-outputs.json | jq -c '.')" >> $GITHUB_OUTPUT
+
+    outputs:
+      infra: ${{ steps.parse.outputs.INFRA_OUTPUTS }}
+
+  build-backend:
+    runs-on: ubuntu-latest
+    needs: download-infra-outputs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1.7.0
+        with:
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_TO_ASSUME_NAME }}"
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven
+
+      - name: Build Backend
+        working-directory: ${{ env.WORKING_DIR_BACKEND }}
+        run: |
+          mvn wrapper:wrapper
+          mvn clean package -DskipTests
+
+      - name: Build & Push Docker Image
+        working-directory: ${{ env.WORKING_DIR_BACKEND }}
+        run: |
+          OUTPUT=${{ fromJson(needs.download-infra-outputs.outputs.infra) }}
+          ECR_REPO="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${OUTPUT.ecr_repository_name.value}"
+
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} \
+            | docker login --username AWS --password-stdin $ECR_REPO
+
+          docker build -t $ECR_REPO:latest .
+          docker push $ECR_REPO:latest
+
+      - name: Update ECS Service
+        run: |
+          OUTPUT=${{ fromJson(needs.download-infra-outputs.outputs.infra) }}
+
+          aws ecs update-service \
+            --cluster ${OUTPUT.ecs_cluster_name.value} \
+            --service ${OUTPUT.ecs_service_name.value} \
+            --force-new-deployment
+
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: download-infra-outputs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1.7.0
+        with:
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ secrets.AWS_ROLE_TO_ASSUME_NAME }}"
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Build Frontend
+        working-directory: ${{ env.WORKING_DIR_FRONTEND }}
+        run: |
+          OUTPUT=${{ fromJson(needs.download-infra-outputs.outputs.infra) }}
+
+          cat << EOF > src/environments/environment.prod.ts
+          export const environment = {
+            production: true,
+            cognito: {
+              userPoolId: '${OUTPUT.user_pool_id.value}',
+              userPoolClientId: '${OUTPUT.user_pool_client_id.value}'
+            }
+          };
+          EOF
+
+          npm install
+          npm run build
+
+      - name: Deploy S3 + CloudFront
+        working-directory: ${{ env.WORKING_DIR_FRONTEND }}
+        run: |
+          OUTPUT=${{ fromJson(needs.download-infra-outputs.outputs.infra) }}
+          BUCKET=${OUTPUT.frontend_bucket_name.value}
+
+          aws s3 sync dist/ s3://$BUCKET/
+
+          aws cloudfront create-invalidation \
+            --distribution-id ${OUTPUT.cloudfront_distribution_id.value} \
+            --paths "/*"
+
+  database-migration:
+    runs-on: ubuntu-latest
+    needs: download-infra-outputs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Run migrations
+        working-directory: ${{ env.WORKING_DIR_DB }}
+        run: |
+          echo "Aquí correrías tus migraciones usando pg_dump o cualquier proceso definido."
+          echo "Este bloque es igual al pipeline actual, solo movido a su propio workflow."
+
+  verify:
+    runs-on: ubuntu-latest
+    needs: [build-backend, build-frontend, database-migration]
+
+    steps:
+      - name: Print URL
+        run: |
+          OUTPUT=${{ fromJson(needs.download-infra-outputs.outputs.infra) }}
+          echo "Frontend URL: https://${OUTPUT.app_domain.value}"
+          echo "Deployment completed successfully!"
